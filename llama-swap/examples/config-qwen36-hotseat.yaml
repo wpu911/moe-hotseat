@@ -1,0 +1,59 @@
+# llama-swap model entry examples for MoE HotSeat v0.
+# Merge these under your top-level `models:` section.
+# Paths are examples. Replace them with your actual container paths.
+
+models:
+  qwen36-35b-a3b-v2-q8:256k:
+    ttl: 1200
+    env:
+      - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+      - "HOTSEAT_TENSOR_LAYERS=18"
+    cmd: >
+      /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
+      --host 127.0.0.1
+      --port ${PORT}
+      --jinja
+      -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
+      -c 262144
+      -ngl 999
+      -t 4
+      -np 1
+      -b 256
+      -ub 64
+      --cache-ram 0
+      --no-mmap
+      --mlock
+      --verbose
+    cmdStop: |
+      bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+    checkEndpoint: /health
+
+  qwen36-vision:256k:
+    ttl: 1200
+    env:
+      - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+      - "HOTSEAT_TENSOR_LAYERS=16"
+    cmd: >
+      /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
+      --host 127.0.0.1
+      --port ${PORT}
+      --jinja
+      -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
+      --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
+      -c 262144
+      -ngl 999
+      -t 4
+      -np 1
+      -b 256
+      -ub 64
+      --cache-ram 0
+      --no-mmap
+      --mlock
+      --verbose
+    cmdStop: |
+      bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+    checkEndpoint: /health

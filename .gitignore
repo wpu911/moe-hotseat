@@ -1,0 +1,11 @@
+/build*/
+*.o
+*.so
+*.a
+*.log
+*.gguf
+*.safetensors
+.DS_Store
+__pycache__/
+*.pyc
+.env
