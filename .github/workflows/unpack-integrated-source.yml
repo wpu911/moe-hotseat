@@ -1,6 +1,7 @@
 name: Expand integrated source tree
 
 on:
+  workflow_dispatch:
   pull_request_target:
     types: [opened, reopened, synchronize]
 
@@ -9,7 +10,7 @@ permissions:
 
 jobs:
   unpack:
-    if: github.event.pull_request.head.ref == 'trigger-source-expand'
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.ref == 'trigger-source-expand'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
