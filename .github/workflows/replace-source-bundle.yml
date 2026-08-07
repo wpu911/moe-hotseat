@@ -1,0 +1,48 @@
+name: Replace integrated source bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.source-bundle-trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Rebuild and verify bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="source/moe-dynamic-hybrid-arena-source-20260807.tar.gz"
+          tmp="$(mktemp)"
+          cat source/.bundle-parts/part-*.b64 | base64 -d > "$tmp"
+          gzip -t "$tmp"
+          actual="$(sha256sum "$tmp" | awk '{print $1}')"
+          expected="ea60e7a6d1e5697f583763b56b44334de51a7bd9ecb9627565ee1d04d1c3d7eb"
+          echo "bundle sha256: $actual"
+          test "$actual" = "$expected"
+          tar -tzf "$tmp" >/dev/null
+          mv "$tmp" "$out"
+
+      - name: Commit verified bundle and remove staging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf source/.bundle-parts
+          rm -f source/.replace-note .source-bundle-trigger
+          rm -f .github/workflows/replace-source-bundle.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Replace truncated integrated source bundle with verified archive"
+          git push origin HEAD:main
