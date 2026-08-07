@@ -1,7 +1,7 @@
 name: Expand integrated source tree
 
 on:
-  issues:
+  pull_request_target:
     types: [opened]
 
 permissions:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   unpack:
-    if: github.event.issue.title == '[automation] expand integrated source'
+    if: github.event.pull_request.head.ref == 'trigger-source-expand'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
@@ -27,8 +27,6 @@ jobs:
           rm -rf patch
           cp -a "$tmp/patch" ./patch
           rm -rf "$tmp"
-
-          # One-shot bootstrapper. Remove it in the generated source commit.
           rm -f .github/workflows/unpack-integrated-source.yml
 
       - name: Commit expanded source
