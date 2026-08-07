@@ -1,347 +1,505 @@
-MoE HotSeat v0 的做法是：
-将前 N 个 transformer block 中的 MoE expert tensors 优先放入 VRAM，后面的 expert tensors 留在 RAM / Host 中。
+# MoE HotSeat: Dynamic-Hybrid + Arena
 
-这不是完整的动态热专家缓存，而是一个静态的 VRAM-first expert tensor placement 策略。
+[中文](#中文) | [English](#english)
 
-为什么做这个项目？
+> Experimental `llama.cpp` patch set for large Mixture-of-Experts inference on memory-constrained GPUs.  
+> This repository combines **HotSeat + HotExpert + Dynamic-Hybrid + Full Shadow + optional Arena** into one integrated source tree.
 
-在消费级显卡上运行大 MoE 模型时，经常会遇到一个尴尬问题：
+> 实验性 `llama.cpp` MoE 推理优化补丁。当前合体版已经把 **HotSeat + HotExpert + Dynamic-Hybrid + Full Shadow + Arena** 合并为一套源码，不需要再按历史版本逐层覆盖补丁。
 
-模型总参数量很大；
-24GB 显存无法完整容纳全部权重；
-全走 CPU / RAM 又太慢；
-普通 offload 粒度不够细；
-统一内存方案可能无法稳定做到 VRAM-first。
+---
 
-MoE HotSeat 的目标不是把整个模型强行塞进显存，而是优先把最值得加速的 expert tensors 放进显存。
+## 中文
 
-当前策略：MoE HotSeat v0
+### 1. 项目目标
 
-当前版本采用静态策略：
+大 MoE 模型在消费级 GPU 上有一个很现实的问题：模型总权重很大，但每个 token 实际只激活一部分 expert。传统按 Transformer 层做 `-ngl` offload 的粒度并不总是适合 MoE，而把整个模型都塞进 24GB 显存又不现实。
 
-HOTSEAT_TENSOR_LAYERS=18
+这个项目的目标不是“把所有东西都塞进 GPU”，而是：
 
-表示：
-
-blk.0  - blk.17 的 expert tensors -> VRAM
-blk.18 - 后续 block 的 expert tensors -> RAM / Host
-
-注意：
-
-这不是“18 个 expert 放进显存”。
-也不是“前 18 层全部放进显存”。
-而是：前 18 个 transformer block 中的 packed MoE expert tensors 放进显存。
-
-实测结果
-
-测试环境示例：
-
-CPU: AMD Ryzen 9 9950X
-GPU: AMD Radeon RX 7900 XTX 24GB
-RAM: 192GB
-Backend: llama.cpp HIP / ROCm
-Model: Qwen3.6 35B A3B Q8 GGUF
-Context: 256K
-
-实测表现：
-
-Text model:
-HotSeat layers: 18
-Threads: -t 4
-Generation speed: ~34.7 token/s
-
-Vision model:
-HotSeat layers: 16
-Threads: -t 4
-Generation speed: ~32.9 token/s
-
-VRAM usage:
-~90%+
-
-这个结果说明：
-在 24GB 显存的消费级 AMD GPU 上，MoE 35B Q8 + 256K 上下文可以通过 expert tensor placement 获得比较可用的本地推理速度。
-
-与普通 -ngl 的区别
-
-普通 -ngl 更像是按层进行 GPU offload。
-
-MoE HotSeat 更细：
-
-普通 -ngl: 以 transformer layer 为主要粒度；
-MoE HotSeat: 针对 MoE expert tensors 做额外 placement 控制。
-
-当前 v0 版本主要控制以下 packed expert tensors：
-
-ffn_gate_exps
-ffn_up_exps
-ffn_down_exps
-线程经验
-
-实测中，CPU 线程并不是越多越好。
-
-在当前环境中：
-
--t 32: 明显变慢，CPU 内耗严重
--t 16: 明显改善
--t 8 : 表现不错
--t 4 : 综合表现最好
--t 2 : CPU 更低，但略慢
-
-最终推荐：
-
--t 4
-
-线程过多时，CPU 调度、内存带宽竞争和 Host tensor 访问可能会拖慢整体推理。
-
-llama-swap 示例
-
-文本模型入口：
-
-qwen36-35b-a3b-v2-q8:256k:
-  ttl: 1200
-  env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
-    - "HIP_VISIBLE_DEVICES=0"
-    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=18"
-  cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
-    --host 127.0.0.1
-    --port ${PORT}
-    --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
-    -c 262144
-    -ngl 999
-    -t 4
-    -np 1
-    -b 256
-    -ub 64
-    --cache-ram 0
-    --no-mmap
-    --mlock
-    --verbose
-  checkEndpoint: /health
-
-视觉模型入口：
-
-qwen36-vision:256k:
-  ttl: 1200
-  env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
-    - "HIP_VISIBLE_DEVICES=0"
-    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=16"
-  cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
-    --host 127.0.0.1
-    --port ${PORT}
-    --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
-    --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
-    -c 262144
-    -ngl 999
-    -t 4
-    -np 1
-    -b 256
-    -ub 64
-    --cache-ram 0
-    --no-mmap
-    --mlock
-    --verbose
-  checkEndpoint: /health
-注意事项
-
-当前建议不要同时启用以下统一内存变量：
-
-HSA_XNACK=1
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
-
-原因是当前 HotSeat v0 的目标是 VRAM-first placement。
-统一内存可能会让 VRAM 与 RAM 的边界变得模糊，导致显存使用不符合预期。
-
-这不是说统一内存无用，而是它属于另一条路线。
-后续可以考虑做 VRAM-first + UMA fallback，但不建议在 v0 阶段混在一起测试。
-
-下一步计划：MoE HotSeat v1
-
-v0 是静态策略：
-
-前 N 个 block 的 expert tensors 进 VRAM
-
-v1 计划变成真正的动态 HotSeat：
-
-统计 router 实际调用了哪些 expert
-记录 layer_id + expert_id 命中次数
-找出真正高频的 hot experts
-让 hot experts 常驻 VRAM
-让 cold experts 留在 RAM / Host
-必要时进行动态迁移和调度
+1. 把最值得加速的 MoE expert 权重放进 VRAM；
+2. 统计运行时真实 router 命中；
+3. 让热点 expert 动态替换冷 expert；
+4. 当某个 MoE 层长期足够热时，允许它晋升为完整 Full Layer；
+5. 利用 Full Shadow Bank 安全完成完整层交换；
+6. 可选地把稳定剩余显存做成 Arena，进一步缓存热点 expert / 完整层；
+7. Host/RAM 始终保留稳定后备，不把系统绑死在一次性的静态布局上。
 
 一句话：
 
-v0 是前排先上车；
-v1 要做到谁热谁坐前排。
+> **显存不是仓库，是热数据的前排座位。谁更热，谁坐前面。**
 
-项目状态
+---
 
-当前项目仍处于实验阶段。
-代码和补丁需要根据具体 llama.cpp 版本适配。
-欢迎测试、修改和提交 issue。
+### 2. 从 HotSeat 到 Dynamic-Hybrid
 
-English
-Overview
+这个仓库经历了三层思路，当前 `patch/` 已经是最终合体结果。
 
-MoE HotSeat is an experimental optimization strategy for local MoE model inference.
+#### HotSeat
 
-The core idea is simple:
+最早的 HotSeat 是静态 VRAM-first placement：
 
-VRAM is not a storage room.
-It is a front-row seat.
-The most important tensors should sit there first.
+```text
+HOTSEAT_TENSOR_LAYERS=N
+```
 
-In MoE models, the largest tensors are often not attention, norm, or router weights, but packed expert tensors, such as:
+前 N 个 Transformer block 的 packed MoE expert tensors 优先放 VRAM，后续 expert tensors 留 Host/RAM。
 
+它控制的主要是：
+
+```text
 ffn_gate_exps
 ffn_up_exps
 ffn_down_exps
+ffn_gate_up_exps   # 取决于模型/llama.cpp 版本
+```
 
-MoE HotSeat v0 places the expert tensors of the first N transformer blocks into VRAM, while keeping later expert tensors in RAM / Host memory.
+#### HotExpert
 
-This is not yet a fully dynamic hot expert cache.
-It is a static VRAM-first expert tensor placement strategy.
+HotExpert 开始记录 router 对 `layer_id + expert_id` 的真实使用次数，并维护每层的热点专家集合。这样不再只按“层号靠前”决定谁在 GPU，而是按真实访问热度调整。
 
-Why this project?
+#### Dynamic-Hybrid
 
-When running large MoE models on consumer GPUs, we often face a painful tradeoff:
+最终 Dynamic-Hybrid 同时管理两种 GPU residency：
 
-The total model size is large;
-24GB VRAM cannot hold everything comfortably;
-CPU / RAM-only inference is too slow;
-Traditional layer-level offload is not fine-grained enough;
-Unified memory may not reliably enforce VRAM-first placement.
+- **Full Layer**：整层 MoE expert tensors 完整驻留 GPU；
+- **Top-N / Top-64**：非 Full 层只保留最热的一部分 expert；
+- **Dynamic expert pool**：用额外 slot 做单 expert 的动态 promotion；
+- **Full Shadow Bank**：给完整层 swap 提供安全中转；
+- **Arena**：可选的弹性 VRAM 二级缓存。
 
-MoE HotSeat does not try to force the entire model into VRAM.
-Instead, it prioritizes the most valuable expert tensors.
+当前核心模式：
 
-Current Strategy: MoE HotSeat v0
+```bash
+HOTSEAT_RUNTIME_MODE=dynamic-hybrid
+```
 
-Example:
+---
 
-HOTSEAT_TENSOR_LAYERS=18
+### 3. Runtime 内存结构
 
-This means:
+```text
+Host / RAM
+│
+├─ 完整 GGUF / Host backing
+└─ Dynamic-Hybrid 下所有 MoE expert tensors 的稳定后备副本
 
-Expert tensors in blk.0  - blk.17 -> VRAM
-Expert tensors in blk.18 and later -> RAM / Host
+GPU / VRAM
+│
+├─ 普通 llama.cpp GPU tensors
+├─ KV cache / runtime buffers
+│
+├─ Full-Layer banks
+│   └─ 默认 10 个，可由 HOTSEAT_FULL_LAYER_COUNT 调整
+│
+├─ Full Shadow bank
+│   └─ 专门用于普通 full_layer_swap 的 staging / rotation
+│
+├─ Top-N banks
+│   └─ 非 Full 层的热点 expert 集合
+│
+├─ Dynamic expert pool
+│   └─ 日志里的 pool_slot
+│
+└─ Optional Arena
+    ├─ 额外 hot experts
+    └─ 可选 arena-backed full layer
+```
 
-Important clarification:
+这几个概念不要混：
 
-This does not mean “18 experts are placed in VRAM”.
-It also does not mean “the first 18 full transformer layers are placed in VRAM”.
+| 组件 | 作用 |
+|---|---|
+| Full Shadow Bank | 完整 Full Layer 交换的中转槽 |
+| Dynamic expert pool | 单 expert 的固定动态槽位 |
+| Arena | 根据剩余显存动态预留的额外弹性缓存 |
 
-It means:
-the packed MoE expert tensors in the first 18 transformer blocks are placed in VRAM.
+---
 
-Benchmark Example
+### 4. Dynamic-Hybrid 的完整层交换
 
-Test environment:
+完整层不会因为某个窗口突然变热就立刻搬家。源码会先积累足够统计数据，并要求候选层持续优于当前最冷 Full Layer。
 
-CPU: AMD Ryzen 9 9950X
-GPU: AMD Radeon RX 7900 XTX 24GB
-RAM: 192GB
-Backend: llama.cpp HIP / ROCm
-Model: Qwen3.6 35B A3B Q8 GGUF
-Context: 256K
+当前源码默认的 Full-Layer readiness 条件：
 
-Observed results:
+```text
+HOTSEAT_PROFILE_MIN_DECODE  = 16384
+HOTSEAT_PROFILE_MIN_PREFILL = 16384
+HOTSEAT_PROFILE_MIN_REQUESTS = 8
+```
 
-Text model:
-HotSeat layers: 18
-Threads: -t 4
-Generation speed: ~34.7 token/s
+三个条件默认都要满足，之后才允许普通 `full_layer_swap` 进入候选判断。
 
-Vision model:
-HotSeat layers: 16
-Threads: -t 4
-Generation speed: ~32.9 token/s
+普通完整层判定的关键默认值：
 
-VRAM usage:
-~90%+
+```text
+HOTSEAT_LAYER_RATIO             = 1.25
+HOTSEAT_LAYER_CONFIRM_WINDOWS   = 3
+HOTSEAT_LAYER_COOLDOWN_REQUESTS = 8
+```
 
-This shows that a 24GB consumer AMD GPU can run a MoE 35B Q8 model with a 256K context at practical speeds when expert tensor placement is handled carefully.
+也就是候选非 Full 层的收益分数要达到当前最冷 Full 层约 `1.25x`，并连续确认 3 个窗口，才执行完整层 promotion / demotion。
 
-Difference from regular -ngl
+运行日志中普通完整层交换事件：
 
-Regular -ngl is mostly layer-level GPU offload.
+```json
+{"event":"full_layer_swap", ...}
+```
 
-MoE HotSeat is more fine-grained:
+---
 
-Regular -ngl: mainly transformer-layer granularity;
-MoE HotSeat: additional placement control for packed MoE expert tensors.
+### 5. Full Shadow Bank 修复
 
-Current v0 focuses on:
+当前合体源码包含一个很重要的 Full Shadow 轮换修复：
 
-ffn_gate_exps
-ffn_up_exps
-ffn_down_exps
-Thread Tuning
+```cpp
+s.full_shadow_idx = old_full;
+```
 
-More CPU threads are not always better.
+完整层交换后：
 
-In this test setup:
+```text
+new_full        -> 正式服务晋升层
+old_full        -> 被降级并成为新的 idle shadow
+full_shadow_idx -> old_full
+```
 
--t 32: much slower, heavy CPU contention
--t 16: significantly better
--t 8 : good
--t 4 : best balanced result
--t 2 : lower CPU usage, slightly slower
+如果不轮换 shadow，下一次 Full-Layer swap 可能再次把数据拷进已经在服务的 `new_full` bank，存在覆盖正在使用 bank 的风险。
 
-Recommended setting:
+本仓库 `patch/ggml/src/ggml-cuda/hotexpert-runtime.cu` 已包含该修复。
 
--t 4
+---
 
-Too many CPU threads may increase scheduling overhead, memory bandwidth contention, and Host tensor access overhead.
+### 6. Dynamic Expert
 
-llama-swap Example
+普通 expert 级动态替换默认以更短窗口工作。
 
-Text model:
+核心默认参数：
 
-qwen36-35b-a3b-v2-q8:256k:
+```text
+HOTSEAT_EXPERT_EVAL_TOKENS     = 4096
+HOTSEAT_EXPERT_CONFIRM_WINDOWS = 2
+HOTSEAT_EXPERT_RATIO           = 1.25
+HOTSEAT_EXPERT_MAX_SWAP        = 8
+```
+
+当非 resident expert 的短期 EWMA 足够高、持续超过当前 resident 最冷 expert，并通过确认窗口后，会生成 `expert_swap`。
+
+日志示例：
+
+```json
+{
+  "event": "expert_swap",
+  "generation": 12,
+  "layer": 29,
+  "expert": 123,
+  "victim": 45,
+  "pool_slot": 17,
+  "bytes": 12345678,
+  "copy_us": 1234.5
+}
+```
+
+`pool_slot` 属于 Dynamic expert pool，不是 Arena。
+
+---
+
+### 7. Arena 是什么
+
+Arena 是一块**根据真实 workload 的显存低水位测出来的额外 VRAM 缓存**。
+
+它的目的不是盲目吃满显存，而是把长期稳定剩余的那部分显存变成动态缓存，减少 Host/RAM -> GPU 的重复 PCIe 搬运。
+
+典型场景：
+
+```text
+A expert 热 -> 进 GPU
+B expert 热 -> 进 GPU
+A 暂时降温
+A 很快又热
+```
+
+没有额外弹性容量时，A 可能被反复换出/换入。Arena 有安全余量时，可以让部分热点继续留在 VRAM，减少抖动。
+
+---
+
+### 8. Arena 两阶段工作流
+
+Arena **不是只开一个变量就直接按当前瞬时空闲显存分配**。当前源码采用两阶段：
+
+#### 阶段 1：Measure
+
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_AUTO_PROFILE_DIR=/path/to/profile-dir
+```
+
+当没有 `HOTSEAT_ARENA_APPLY_PROFILE` 时，runtime 会进入 measure mode：
+
+```text
+tracking low-water only, capacity off
+```
+
+它持续记录真实运行过程中物理显存最低空闲值，并写入 fingerprint-scoped profile。
+
+默认 profile 目录如果没有显式配置，是：
+
+```text
+/app/share/openclaw_tools/hotexpert-profiles
+```
+
+推荐每个模型/模式显式拆目录，例如：
+
+```text
+Qwen Text   -> hotseat/arena-text/
+Qwen Vision -> hotseat/arena-vision/
+Ornith      -> hotseat/arena-ornith/
+```
+
+这是因为 Text 与 Vision 即使共用同一主 GGUF，Vision 还有 `mmproj` 显存压力，不能理所当然共用同一 Arena low-water 结果。
+
+#### 阶段 2：Apply
+
+测量完成后：
+
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_ARENA_APPLY_PROFILE=/path/to/<fingerprint>.profile.json
+```
+
+重新 unload/load 模型后，Arena 才真正按历史 low-water 计算容量。
+
+当前源码默认 sizing 参数：
+
+```text
+HOTSEAT_ARENA_TARGET_FREE_MB = 800
+HOTSEAT_ARENA_JITTER_MB      = 256
+HOTSEAT_ARENA_GROW_STEP_MB   = 256
+HOTSEAT_ARENA_PAGE_MB        = 2
+```
+
+逻辑近似为：
+
+```text
+可分配 Arena
+≈ measured_low_water
+  - target_free
+  - jitter
+```
+
+然后按 grow step 向下取整。低于约 256 MiB 时不启用 Arena。
+
+这意味着 Arena 会主动给后续 Prefill、KV、HIP workspace 等波动留下缓冲，不是把显存压到 0 MiB 再祈祷。
+
+---
+
+### 9. Arena 动态事件
+
+Arena 生效后可能出现：
+
+```text
+arena_expand
+arena_retire
+```
+
+如果另外显式打开：
+
+```bash
+HOTSEAT_ARENA_FULL_LAYER_ENABLE=1
+```
+
+还允许 Arena 走独立的完整层 promotion 路径，日志可能出现：
+
+```text
+arena_full_swap
+```
+
+Arena Full Layer 和普通 Full Shadow `full_layer_swap` 是两条不同路径。
+
+---
+
+### 10. 推荐目录结构
+
+```text
+moe-hotseat/
+├─ README.md
+├─ LICENSE
+├─ MANIFEST.md
+├─ examples/
+│  ├─ arena-env.example
+│  └─ llama-swap-dynamic-hybrid-arena.yaml
+└─ patch/
+   ├─ ggml/
+   │  ├─ include/
+   │  │  └─ ggml-hotexpert.h
+   │  └─ src/
+   │     ├─ CMakeLists.txt
+   │     ├─ ggml-hotexpert.cpp
+   │     └─ ggml-cuda/
+   │        ├─ common.cuh
+   │        ├─ ggml-cuda.cu
+   │        ├─ hotexpert-arena.cu
+   │        ├─ hotexpert-arena.cuh
+   │        ├─ hotexpert-cache.cu
+   │        ├─ hotexpert-cache.cuh
+   │        ├─ hotexpert-descriptor.cu
+   │        ├─ hotexpert-descriptor.cuh
+   │        ├─ hotexpert-planner.cu
+   │        ├─ hotexpert-planner.cuh
+   │        ├─ hotexpert-profiler.cu
+   │        ├─ hotexpert-profiler.cuh
+   │        ├─ hotexpert-runtime.cu
+   │        ├─ hotexpert-runtime.cuh
+   │        ├─ mmq.cu
+   │        ├─ mmvq.cu
+   │        └─ topk-moe.cu
+   ├─ src/
+   │  ├─ llama-graph.cpp
+   │  └─ llama-model-loader.cpp
+   └─ tools/server/
+      └─ server.cpp
+```
+
+`patch/` 是已经按下面顺序合并后的最终源码：
+
+```text
+HotSeat -> HotExpert -> Dynamic-Hybrid + Arena -> Full Shadow rotation fix
+```
+
+不需要再手工把历史三套源码互相覆盖。
+
+---
+
+### 11. 如何套到 llama.cpp
+
+> 注意：这是实验补丁，不保证对任意 upstream `llama.cpp` commit 无冲突。建议先复制一份源码树再操作。
+
+假设：
+
+```text
+/path/to/llama.cpp
+/path/to/moe-hotseat
+```
+
+可以把最终 patch tree 覆盖到目标 llama.cpp：
+
+```bash
+cp -a /path/to/moe-hotseat/patch/. /path/to/llama.cpp/
+```
+
+然后重新配置/编译 HIP 版本。一个常见示例是：
+
+```bash
+cd /path/to/llama.cpp
+cmake -B build-hip \
+  -DGGML_HIP=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip -j"$(nproc)" --target llama-server llama-cli
+```
+
+如果你的上游版本已经改变了 MoE graph、CUDA/HIP kernel、model loader 或 server，应该按 diff 手工 rebase，而不是闭眼覆盖。软件最喜欢在“应该没事”之后安排节目。
+
+---
+
+### 12. 当前验证环境
+
+当前这套合体源码主要在以下环境验证：
+
+```text
+CPU     AMD Ryzen 9 9950X
+RAM     ~192 GB
+GPU     AMD Radeon RX 7900 XTX 24 GB
+OS      Ubuntu
+Backend llama.cpp HIP / ROCm
+Serving llama-swap -> llama-server
+Context 256K
+```
+
+主要验证模型：
+
+```text
+Qwen3.6 35B A3B Q8_0
+Qwen3.6 35B A3B Q8_0 + mmproj Vision
+Huihui Ornith 35B A3B Q8_0
+```
+
+这里的配置是针对 24GB VRAM 调出来的示例，不应当被当成所有 GPU 的最佳值。
+
+---
+
+## 13. llama-swap 完整启动参数
+
+完整可复制配置同时放在：
+
+```text
+examples/llama-swap-dynamic-hybrid-arena.yaml
+```
+
+下面是当前实际使用的三个模型配置。这里先处于 **Arena Measure 阶段**，所以还没有写 `HOTSEAT_ARENA_APPLY_PROFILE`。
+
+### 13.1 Qwen3.6 35B A3B Text, 256K
+
+```yaml
+qwen3.6-35b:256k:
   ttl: 1200
   env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
     - "HIP_VISIBLE_DEVICES=0"
     - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=18"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotseat-hybrid-10.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotexpert-profile-1024.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15,12"
+    - "HOTSEAT_FULL_LAYER_COUNT=10"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/arena-text"
+    - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/swaps.jsonl"
   cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
     --host 127.0.0.1
     --port ${PORT}
     --jinja
     -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
     -c 262144
     -ngl 999
-    -t 4
+    -t 6
+    -tb 16
     -np 1
-    -b 256
-    -ub 64
+    -b 2048
+    -ub 1024
     --cache-ram 0
     --no-mmap
     --mlock
-    --verbose
+  cmdStop: |
+    bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
   checkEndpoint: /health
+```
 
-Vision model:
+### 13.2 Qwen3.6 35B A3B Vision, 256K
 
-qwen36-vision:256k:
+Vision 使用同一主 GGUF，但额外挂 `mmproj-BF16.gguf`，为了显存余量当前使用 9 个初始 Full Layer，而不是文本版的 10 个。
+
+```yaml
+qwen3.6-35b-vision:256k:
   ttl: 1200
   env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
     - "HIP_VISIBLE_DEVICES=0"
     - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=16"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotseat-hybrid-10.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotexpert-profile-1024.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15"
+    - "HOTSEAT_FULL_LAYER_COUNT=9"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/arena-vision"
+    - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/swaps-vision.jsonl"
   cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
     --host 127.0.0.1
     --port ${PORT}
     --jinja
@@ -349,51 +507,481 @@ qwen36-vision:256k:
     --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
     -c 262144
     -ngl 999
-    -t 4
+    -t 6
+    -tb 16
     -np 1
-    -b 256
-    -ub 64
+    -b 2048
+    -ub 1024
     --cache-ram 0
     --no-mmap
     --mlock
-    --verbose
+  cmdStop: |
+    bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
   checkEndpoint: /health
-Notes
+```
 
-For the current v0 implementation, it is recommended not to enable:
+### 13.3 Huihui Ornith 35B A3B, 256K
 
-HSA_XNACK=1
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+```yaml
+ornith-35b:256k:
+  ttl: 1200
+  env:
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
+    - "HIP_VISIBLE_DEVICES=0"
+    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/qwen36-hotseat-hybrid-10.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/qwen36-hotexpert-profile-1024.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15,12"
+    - "HOTSEAT_FULL_LAYER_COUNT=10"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/arena-ornith"
+    - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/swaps.jsonl"
+  cmd: >
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
+    --host 127.0.0.1
+    --port ${PORT}
+    --jinja
+    -m /app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/ornith-1.0-35b-Q8_0.gguf
+    -c 262144
+    -ngl 999
+    -t 6
+    -tb 16
+    -np 1
+    -b 2048
+    -ub 1024
+    --cache-ram 0
+    --no-mmap
+    --mlock
+  cmdStop: |
+    bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+  checkEndpoint: /health
+```
 
-The reason is that v0 focuses on VRAM-first placement.
-Unified memory may blur the boundary between VRAM and RAM, making placement harder to reason about.
+### 13.4 Arena Apply 阶段怎么加
 
-This does not mean unified memory is useless.
-It may be useful in a future VRAM-first + UMA fallback design.
+每个模型先跑出自己的 profile。之后在对应 `env:` 中追加：
 
-Roadmap: MoE HotSeat v1
+```yaml
+- "HOTSEAT_ARENA_APPLY_PROFILE=/对应模型/arena目录/<fingerprint>.profile.json"
+```
 
-v0 is static:
+然后 unload -> load。
 
-Expert tensors of the first N blocks go into VRAM.
+建议继续保持三套目录分离：
 
-v1 should become a real dynamic HotSeat:
+```text
+arena-text
+arena-vision
+arena-ornith
+```
 
-Track router-selected experts
-Record layer_id + expert_id hit counts
-Identify truly hot experts
-Keep hot experts resident in VRAM
-Keep cold experts in RAM / Host
-Support dynamic migration and scheduling
+---
 
-In one sentence:
+### 14. 常用环境变量
 
-v0 lets the front rows board first;
-v1 lets the truly hot experts sit in front.
+下面这些来自当前合体源码，默认值以当前源码实现为准。
 
-Status
+| 环境变量 | 默认/示例 | 作用 |
+|---|---:|---|
+| `HOTSEAT_RUNTIME_MODE` | `static` | `dynamic-experts` / `dynamic-hybrid` |
+| `HOTSEAT_RUNTIME_PROFILE` | 自动/可指定 | 初始 expert ranking / runtime profile |
+| `HOTSEAT_RUNTIME_INIT_FULL_LAYERS` | 可指定 | Dynamic-Hybrid 初始 Full Layer 集合 |
+| `HOTSEAT_FULL_LAYER_COUNT` | `10` | Full Layer bank 数量 |
+| `HOTSEAT_FULL_SHADOW` | `1` | `0` 关闭 Full Shadow，默认开启 |
+| `HOTSEAT_EXPERT_EVAL_TOKENS` | `4096` | expert 评估 token 周期 |
+| `HOTSEAT_EXPERT_CONFIRM_WINDOWS` | `2` | expert promotion 连续确认窗口 |
+| `HOTSEAT_EXPERT_RATIO` | `1.25` | expert 候选/最冷 resident 比例阈值 |
+| `HOTSEAT_EXPERT_MAX_SWAP` | `8` | 每次评估最多普通 expert swap 数 |
+| `HOTSEAT_PROFILE_MIN_DECODE` | `16384` | Full-Layer migration 最低累计 decode |
+| `HOTSEAT_PROFILE_MIN_PREFILL` | `16384` | Full-Layer migration 最低累计 prefill |
+| `HOTSEAT_PROFILE_MIN_REQUESTS` | `8` | Full-Layer migration 最低请求数 |
+| `HOTSEAT_LAYER_RATIO` | `1.25` | Full-Layer promotion 比例阈值 |
+| `HOTSEAT_LAYER_CONFIRM_WINDOWS` | `3` | Full-Layer 连续确认窗口 |
+| `HOTSEAT_LAYER_COOLDOWN_REQUESTS` | `8` | Full swap 后冷却请求数 |
+| `HOTSEAT_RUNTIME_LOG` | 可指定 | JSONL runtime 事件日志 |
+| `HOTSEAT_AUTO_RESERVE_ARENA` | `0` | `1` 开启 Arena measure/apply 逻辑 |
+| `HOTSEAT_AUTO_PROFILE_DIR` | `/app/share/openclaw_tools/hotexpert-profiles` | profile / plan 默认目录 |
+| `HOTSEAT_ARENA_APPLY_PROFILE` | 无 | 指定上一轮 low-water profile |
+| `HOTSEAT_ARENA_TARGET_FREE_MB` | `800` | Arena 后仍希望保留的物理空闲显存 |
+| `HOTSEAT_ARENA_JITTER_MB` | `256` | 额外显存波动安全垫 |
+| `HOTSEAT_ARENA_GROW_STEP_MB` | `256` | Arena 容量增长粒度 |
+| `HOTSEAT_ARENA_PAGE_MB` | `2` | Arena page 大小 |
+| `HOTSEAT_ARENA_MAX_EXPERT_CHANGES` | `16` | 单次 Arena expert 变化数量上限 |
+| `HOTSEAT_ARENA_MAX_REBALANCE_MB` | `256` | 单次 Arena rebalance 字节预算 |
+| `HOTSEAT_ARENA_RETIRE_FLOOR` | `0.01` | Arena cold expert retirement floor |
+| `HOTSEAT_ARENA_FULL_LAYER_ENABLE` | `0` | `1` 开启 Arena-backed full-layer 路径 |
 
-This project is experimental.
-The patch may need adaptation for different llama.cpp versions.
-Issues and experiments are welcome.
-EOF
+---
+
+### 15. 如何确认真的生效
+
+加载模型后先确认实际二进制和动态库来自 patched tree：
+
+```bash
+PID=$(pgrep -xo llama-server)
+readlink -f /proc/$PID/exe
+grep -E 'libggml-hip\.so|libllama\.so|libllama-server-impl\.so' /proc/$PID/maps \
+  | awk '{print $6}' | sort -u
+tr '\0' '\n' < /proc/$PID/environ | grep '^HOTSEAT_' | sort
+```
+
+重点日志事件：
+
+```text
+expert_swap       普通单 expert 动态替换
+full_layer_swap   普通 Full Shadow 完整层交换
+arena_expand      Arena 加入额外 expert
+arena_retire      Arena 回收冷 expert
+arena_full_swap   Arena-backed 完整层交换
+```
+
+如果只看到 `expert_swap`，并不等于 Full Layer 动态逻辑失效。普通 `full_layer_swap` 需要先满足 profile readiness、ratio、confirm windows 和 cooldown 条件。
+
+---
+
+### 16. 已知边界与风险
+
+- 这是实验性 llama.cpp patch，不是 upstream 官方 feature。
+- 不同 llama.cpp 版本的 graph / model loader / server / CUDA-HIP kernel 可能变化，需要 rebase。
+- 24GB 卡上 Arena 不能只看启动后的瞬时 free VRAM，必须用真实 workload low-water。
+- Vision 与 Text 应分开测 Arena profile。
+- `HOTSEAT_ARENA_FULL_LAYER_ENABLE=1` 是额外路径，建议先把普通 Full Shadow 路径跑稳再开。
+- 长上下文、大 Prefill、大 batch、Vision `mmproj` 都可能改变显存最低水位。
+- 当前公开源码是实验工程代码，建议先在独立 llama.cpp tree 编译验证，不要覆盖唯一生产源码。
+
+---
+
+## English
+
+### 1. Goal
+
+Large MoE models are awkward on consumer GPUs: total parameter size is huge, while each token activates only a subset of experts. Traditional layer-level offload is often too coarse, and forcing the entire model into a 24 GB GPU is unrealistic.
+
+This project tries to make VRAM residency adaptive instead:
+
+1. keep the most valuable MoE expert weights in VRAM;
+2. observe real router traffic;
+3. promote hot experts and evict colder residents;
+4. promote persistently hot MoE layers into full GPU-resident layers;
+5. use a rotating Full Shadow bank for safe structural swaps;
+6. optionally turn stable free VRAM into an adaptive Arena;
+7. keep host memory as the stable backing store.
+
+In short:
+
+> **VRAM is not a warehouse. It is the front row for hot data.**
+
+---
+
+### 2. Evolution: HotSeat -> HotExpert -> Dynamic-Hybrid
+
+#### HotSeat
+
+The original HotSeat implementation was static VRAM-first placement:
+
+```text
+HOTSEAT_TENSOR_LAYERS=N
+```
+
+Packed MoE expert tensors in the first N transformer blocks were preferentially placed in VRAM, while later expert tensors remained in Host/RAM.
+
+#### HotExpert
+
+HotExpert adds router-hit accounting for `layer_id + expert_id` and maintains per-layer hot expert sets. GPU residency can therefore follow actual traffic rather than block order alone.
+
+#### Dynamic-Hybrid
+
+Dynamic-Hybrid manages multiple residency classes at once:
+
+- Full-Layer banks;
+- Top-N / Top-64 banks for non-full layers;
+- a dynamic expert pool;
+- one Full Shadow bank;
+- an optional Arena.
+
+Enable it with:
+
+```bash
+HOTSEAT_RUNTIME_MODE=dynamic-hybrid
+```
+
+---
+
+### 3. Runtime memory layout
+
+```text
+Host / RAM
+  └─ stable backing copy of all MoE expert tensors
+
+GPU / VRAM
+  ├─ normal llama.cpp GPU tensors
+  ├─ KV / runtime buffers
+  ├─ Full-Layer banks
+  ├─ Full Shadow bank
+  ├─ Top-N banks
+  ├─ Dynamic expert pool
+  └─ Optional Arena
+```
+
+Do not confuse these three mechanisms:
+
+| Component | Purpose |
+|---|---|
+| Full Shadow bank | staging slot for ordinary full-layer swaps |
+| Dynamic expert pool | fixed slots used by per-expert promotions |
+| Arena | extra elastic VRAM capacity sized from measured low-water |
+
+---
+
+### 4. Full-layer promotion
+
+The runtime does not move a full layer after a single hot window. The current source requires profile readiness first.
+
+Default readiness thresholds:
+
+```text
+HOTSEAT_PROFILE_MIN_DECODE   = 16384
+HOTSEAT_PROFILE_MIN_PREFILL  = 16384
+HOTSEAT_PROFILE_MIN_REQUESTS = 8
+```
+
+Default structural decision parameters:
+
+```text
+HOTSEAT_LAYER_RATIO             = 1.25
+HOTSEAT_LAYER_CONFIRM_WINDOWS   = 3
+HOTSEAT_LAYER_COOLDOWN_REQUESTS = 8
+```
+
+A non-full candidate must remain sufficiently more valuable than the coldest current full layer for multiple evaluation windows before an ordinary `full_layer_swap` is committed.
+
+---
+
+### 5. Full Shadow rotation fix
+
+The integrated tree includes this fix:
+
+```cpp
+s.full_shadow_idx = old_full;
+```
+
+After the swap, the demoted full bank becomes the next idle shadow. Without rotating the shadow index, a later swap could stage into the bank that was just promoted and is already serving traffic.
+
+---
+
+### 6. Dynamic expert swaps
+
+Default expert-level scheduling parameters include:
+
+```text
+HOTSEAT_EXPERT_EVAL_TOKENS     = 4096
+HOTSEAT_EXPERT_CONFIRM_WINDOWS = 2
+HOTSEAT_EXPERT_RATIO           = 1.25
+HOTSEAT_EXPERT_MAX_SWAP        = 8
+```
+
+Typical log event:
+
+```json
+{"event":"expert_swap", "layer":29, "expert":123, "victim":45, "pool_slot":17}
+```
+
+`pool_slot` belongs to the dynamic expert pool. It is not the Arena.
+
+---
+
+### 7. Arena
+
+Arena turns **stable free VRAM** into an elastic second-level cache. It is deliberately sized from a previous real workload instead of from a single mid-flight `free VRAM` sample.
+
+#### Phase 1: measure
+
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_AUTO_PROFILE_DIR=/path/to/profile-dir
+```
+
+Without `HOTSEAT_ARENA_APPLY_PROFILE`, the runtime tracks the physical free-memory low-water and keeps Arena capacity disabled.
+
+Use separate profile directories for workloads with different VRAM pressure, especially text vs. vision.
+
+#### Phase 2: apply
+
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_ARENA_APPLY_PROFILE=/path/to/<fingerprint>.profile.json
+```
+
+Reload the model after adding the apply profile.
+
+Default sizing controls in the current source:
+
+```text
+HOTSEAT_ARENA_TARGET_FREE_MB = 800
+HOTSEAT_ARENA_JITTER_MB      = 256
+HOTSEAT_ARENA_GROW_STEP_MB   = 256
+HOTSEAT_ARENA_PAGE_MB        = 2
+```
+
+The implementation roughly reserves:
+
+```text
+measured low-water - target free - jitter
+```
+
+rounded down to the grow step, and disables Arena when the remaining capacity is too small.
+
+---
+
+### 8. Arena events
+
+Expected event types include:
+
+```text
+arena_expand
+arena_retire
+```
+
+Optional Arena-backed full-layer promotion is separately gated by:
+
+```bash
+HOTSEAT_ARENA_FULL_LAYER_ENABLE=1
+```
+
+and may emit:
+
+```text
+arena_full_swap
+```
+
+This is a different path from the ordinary Full Shadow `full_layer_swap`.
+
+---
+
+### 9. Integrated source tree
+
+The final merged implementation is expanded under `patch/` and already reflects this overlay order:
+
+```text
+HotSeat -> HotExpert -> Dynamic-Hybrid + Arena -> Full Shadow rotation fix
+```
+
+You do not need to manually overlay the three historical patch stages.
+
+See the Chinese section above for the full file tree.
+
+---
+
+### 10. Applying to llama.cpp
+
+Use a disposable or backed-up llama.cpp tree first:
+
+```bash
+cp -a /path/to/moe-hotseat/patch/. /path/to/llama.cpp/
+```
+
+Typical HIP build example:
+
+```bash
+cd /path/to/llama.cpp
+cmake -B build-hip \
+  -DGGML_HIP=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip -j"$(nproc)" --target llama-server llama-cli
+```
+
+Rebase manually when upstream changes touch model loading, MoE graph construction, HIP/CUDA kernels, or server integration.
+
+---
+
+### 11. Tested setup
+
+Primary validation environment:
+
+```text
+CPU     AMD Ryzen 9 9950X
+RAM     ~192 GB
+GPU     AMD Radeon RX 7900 XTX 24 GB
+OS      Ubuntu
+Backend llama.cpp HIP / ROCm
+Serving llama-swap -> llama-server
+Context 256K
+```
+
+Primary models:
+
+```text
+Qwen3.6 35B A3B Q8_0
+Qwen3.6 35B A3B Q8_0 + BF16 mmproj
+Huihui Ornith 35B A3B Q8_0
+```
+
+These are tuning examples for a 24 GB GPU, not universal optimal settings.
+
+---
+
+### 12. Complete llama-swap examples
+
+See:
+
+```text
+examples/llama-swap-dynamic-hybrid-arena.yaml
+```
+
+It contains the complete current text, vision, and Ornith startup entries, including separated Arena profile directories.
+
+The examples are intentionally in Arena **measure mode** first. After a fingerprint profile has been collected, add:
+
+```yaml
+- "HOTSEAT_ARENA_APPLY_PROFILE=/path/to/<fingerprint>.profile.json"
+```
+
+and reload the model.
+
+---
+
+### 13. Verification
+
+Confirm that the running process and libraries come from the patched build tree:
+
+```bash
+PID=$(pgrep -xo llama-server)
+readlink -f /proc/$PID/exe
+grep -E 'libggml-hip\.so|libllama\.so|libllama-server-impl\.so' /proc/$PID/maps \
+  | awk '{print $6}' | sort -u
+tr '\0' '\n' < /proc/$PID/environ | grep '^HOTSEAT_' | sort
+```
+
+Useful runtime events:
+
+```text
+expert_swap
+full_layer_swap
+arena_expand
+arena_retire
+arena_full_swap
+```
+
+Seeing expert swaps without full-layer swaps is not by itself an error. Full-layer migration has stricter readiness and confirmation requirements.
+
+---
+
+### 14. Status and caveats
+
+- Experimental, not an upstream llama.cpp feature.
+- Rebase work may be required on newer llama.cpp revisions.
+- Arena should be sized from representative real traffic, not startup free VRAM.
+- Text and vision should normally use separate Arena measurement directories.
+- Long context, large prefill, batch size, HIP workspaces, and `mmproj` can all change low-water.
+- Test in a separate source tree before replacing a production build.
+
+---
+
+## License
+
+MIT. See `LICENSE`.
+
+This repository contains modified files derived from `llama.cpp`; preserve applicable upstream copyright and license notices when redistributing modified upstream files.

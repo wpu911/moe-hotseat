@@ -1,0 +1,113 @@
+# MoE HotSeat / HotExpert / Dynamic-Hybrid / Arena
+# Current 24GB RX 7900 XTX examples.
+# Phase 1 = Arena measure mode. Add HOTSEAT_ARENA_APPLY_PROFILE after a profile is generated.
+
+models:
+  qwen3.6-35b:256k:
+    ttl: 1200
+    env:
+      - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+      - "HOTSEAT_TENSOR_LAYERS=0"
+      - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotseat-hybrid-10.json"
+      - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+      - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotexpert-profile-1024.json"
+      - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15,12"
+      - "HOTSEAT_FULL_LAYER_COUNT=10"
+      - "HOTSEAT_FULL_SHADOW=1"
+      - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+      - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/arena-text"
+      - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/swaps.jsonl"
+    cmd: >
+      /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
+      --host 127.0.0.1
+      --port ${PORT}
+      --jinja
+      -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
+      -c 262144
+      -ngl 999
+      -t 6
+      -tb 16
+      -np 1
+      -b 2048
+      -ub 1024
+      --cache-ram 0
+      --no-mmap
+      --mlock
+    cmdStop: |
+      bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+    checkEndpoint: /health
+
+  qwen3.6-35b-vision:256k:
+    ttl: 1200
+    env:
+      - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+      - "HOTSEAT_TENSOR_LAYERS=0"
+      - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotseat-hybrid-10.json"
+      - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+      - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/qwen36-hotexpert-profile-1024.json"
+      - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15"
+      - "HOTSEAT_FULL_LAYER_COUNT=9"
+      - "HOTSEAT_FULL_SHADOW=1"
+      - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+      - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/arena-vision"
+      - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/hotseat/swaps-vision.jsonl"
+    cmd: >
+      /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
+      --host 127.0.0.1
+      --port ${PORT}
+      --jinja
+      -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
+      --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
+      -c 262144
+      -ngl 999
+      -t 6
+      -tb 16
+      -np 1
+      -b 2048
+      -ub 1024
+      --cache-ram 0
+      --no-mmap
+      --mlock
+    cmdStop: |
+      bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+    checkEndpoint: /health
+
+  ornith-35b:256k:
+    ttl: 1200
+    env:
+      - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin:/opt/rocm/lib"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
+      - "HOTSEAT_TENSOR_LAYERS=0"
+      - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/qwen36-hotseat-hybrid-10.json"
+      - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+      - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/qwen36-hotexpert-profile-1024.json"
+      - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15,12"
+      - "HOTSEAT_FULL_LAYER_COUNT=10"
+      - "HOTSEAT_FULL_SHADOW=1"
+      - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+      - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/arena-ornith"
+      - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/hotseat/swaps.jsonl"
+    cmd: >
+      /app/share/llama_box/src/llama.cpp-b10235-hotexpert/build-hip/bin/llama-server
+      --host 127.0.0.1
+      --port ${PORT}
+      --jinja
+      -m /app/share/llm/Huihui-Ornith-1.0-35B-abliterated-GGUF/ornith-1.0-35b-Q8_0.gguf
+      -c 262144
+      -ngl 999
+      -t 6
+      -tb 16
+      -np 1
+      -b 2048
+      -ub 1024
+      --cache-ram 0
+      --no-mmap
+      --mlock
+    cmdStop: |
+      bash -lc 'pkill -f "llama-server.*--port ${PORT}" || true'
+    checkEndpoint: /health
