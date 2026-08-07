@@ -1,0 +1,49 @@
+name: Expand integrated source tree
+
+on:
+  push:
+    branches:
+      - dynamic-hybrid-arena
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: dynamic-hybrid-arena
+          fetch-depth: 0
+
+      - name: Expand integrated source bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          tar -xzf source/moe-dynamic-hybrid-arena-source-20260807.tar.gz -C "$tmp"
+          rm -rf patch
+          cp -a "$tmp/patch" ./patch
+          rm -rf "$tmp"
+
+          # This workflow is only a one-shot bootstrapper. Remove it from the
+          # resulting source commit so the repository does not carry a deploy
+          # robot forever for a job that has already finished.
+          rm -f .github/workflows/unpack-integrated-source.yml
+
+      - name: Commit expanded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A patch .github/workflows/unpack-integrated-source.yml
+          if git diff --cached --quiet; then
+            echo "No source changes to commit"
+            exit 0
+          fi
+          git commit -m "Expand integrated Dynamic-Hybrid Arena source tree"
+          git push origin HEAD:dynamic-hybrid-arena
