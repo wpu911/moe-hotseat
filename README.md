@@ -1,399 +1,264 @@
-MoE HotSeat v0 的做法是：
-将前 N 个 transformer block 中的 MoE expert tensors 优先放入 VRAM，后面的 expert tensors 留在 RAM / Host 中。
+# MoE HotSeat: Dynamic Hybrid + Arena
 
-这不是完整的动态热专家缓存，而是一个静态的 VRAM-first expert tensor placement 策略。
+[中文](#中文) | [English](#english)
 
-为什么做这个项目？
+> Experimental llama.cpp patch set for consumer-GPU MoE inference. It combines static HotSeat placement, per-expert HotExpert caching, Dynamic-Hybrid full-layer promotion/demotion, and an optional adaptive VRAM Arena.
 
-在消费级显卡上运行大 MoE 模型时，经常会遇到一个尴尬问题：
+## 中文
 
-模型总参数量很大；
-24GB 显存无法完整容纳全部权重；
-全走 CPU / RAM 又太慢；
-普通 offload 粒度不够细；
-统一内存方案可能无法稳定做到 VRAM-first。
+### 这是什么
 
-MoE HotSeat 的目标不是把整个模型强行塞进显存，而是优先把最值得加速的 expert tensors 放进显存。
+这个仓库把原来的 **MoE HotSeat** 从“前 N 层专家张量固定进显存”升级为一套合体运行时：
 
-当前策略：MoE HotSeat v0
+- **HotSeat**：控制 MoE packed expert tensors 的 VRAM-first placement。
+- **HotExpert**：按 `layer_id + expert_id` 统计 router 命中并维护热点专家缓存。
+- **Dynamic-Hybrid**：同时管理 Full-Layer bank 与 Top-64 expert bank，可在运行时提升/降级完整 MoE 层。
+- **Full Shadow Bank**：完整层切换使用独立 shadow bank，切换后轮换 shadow，避免下一次 swap 覆盖正在服务的 full bank。
+- **Arena**：利用真实 workload 测得的显存 low-water mark，为额外热点专家/整层预留弹性 VRAM 缓存。
 
-当前版本采用静态策略：
+目标不是把整个 MoE 模型硬塞进显存，而是让最值得加速的权重优先留在 GPU，并在热点变化时动态调整。
 
-HOTSEAT_TENSOR_LAYERS=18
+### 当前合体版结构
 
-表示：
+```text
+Host / RAM
+  └─ 全量 MoE expert tensors（Dynamic-Hybrid 模式下作为稳定后备）
 
-blk.0  - blk.17 的 expert tensors -> VRAM
-blk.18 - 后续 block 的 expert tensors -> RAM / Host
+GPU / VRAM
+  ├─ Full-Layer banks
+  ├─ Full Shadow bank
+  ├─ Top-64 banks
+  ├─ Dynamic expert pool
+  └─ Optional Arena
+```
 
-注意：
+### 关键模式
 
-这不是“18 个 expert 放进显存”。
-也不是“前 18 层全部放进显存”。
-而是：前 18 个 transformer block 中的 packed MoE expert tensors 放进显存。
+```bash
+HOTSEAT_RUNTIME_MODE=dynamic-hybrid
+```
 
-实测结果
+在 `dynamic-hybrid` 下：
 
-测试环境示例：
+1. MoE expert tensors 保持 host-resident 后备副本；
+2. runtime 拥有固定数量的 Full-Layer banks 与 Top-64 banks；
+3. router 命中统计驱动专家替换；
+4. 当完整层晋升条件满足时，可发生 `full_layer_swap`；
+5. Arena 可额外利用安全显存余量，降低热点抖动和 PCIe 重搬运。
 
-CPU: AMD Ryzen 9 9950X
-GPU: AMD Radeon RX 7900 XTX 24GB
-RAM: 192GB
-Backend: llama.cpp HIP / ROCm
-Model: Qwen3.6 35B A3B Q8 GGUF
-Context: 256K
+### Full Shadow 修复
 
-实测表现：
+本仓库的最终合体源码已经包含 shadow 轮换修复：
 
-Text model:
-HotSeat layers: 18
-Threads: -t 4
-Generation speed: ~34.7 token/s
+```cpp
+s.full_shadow_idx = old_full;
+```
 
-Vision model:
-HotSeat layers: 16
-Threads: -t 4
-Generation speed: ~32.9 token/s
+完整层交换完成后，被降级的旧 full bank 会成为新的 idle shadow bank。这样下一次完整层交换不会错误覆盖刚刚晋升、正在服务的 `new_full`。
 
-VRAM usage:
-~90%+
+### Arena
 
-这个结果说明：
-在 24GB 显存的消费级 AMD GPU 上，MoE 35B Q8 + 256K 上下文可以通过 expert tensor placement 获得比较可用的本地推理速度。
+Arena 默认不是“看见剩余显存就全吃掉”。推荐两阶段使用。
 
-与普通 -ngl 的区别
+第一阶段，测量真实 workload 的显存低水位：
 
-普通 -ngl 更像是按层进行 GPU offload。
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_AUTO_PROFILE_DIR=/path/to/arena-profile-dir
+```
 
-MoE HotSeat 更细：
+跑一段真实请求后，会按模型 fingerprint 在指定目录产生 profile。建议文本、Vision、不同模型使用不同目录，避免同主 GGUF + mmproj 场景互相覆盖测量结果。
 
-普通 -ngl: 以 transformer layer 为主要粒度；
-MoE HotSeat: 针对 MoE expert tensors 做额外 placement 控制。
+第二阶段，应用测量结果：
 
-当前 v0 版本主要控制以下 packed expert tensors：
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_ARENA_APPLY_PROFILE=/path/to/<fingerprint>.profile.json
+```
 
-ffn_gate_exps
-ffn_up_exps
-ffn_down_exps
-线程经验
+然后重新加载模型，Arena 才按测得的安全余量正式预留。
 
-实测中，CPU 线程并不是越多越好。
+### 示例配置
 
-在当前环境中：
+Qwen3.6 35B A3B 文本版示例：
 
--t 32: 明显变慢，CPU 内耗严重
--t 16: 明显改善
--t 8 : 表现不错
--t 4 : 综合表现最好
--t 2 : CPU 更低，但略慢
-
-最终推荐：
-
--t 4
-
-线程过多时，CPU 调度、内存带宽竞争和 Host tensor 访问可能会拖慢整体推理。
-
-llama-swap 示例
-
-文本模型入口：
-
-qwen36-35b-a3b-v2-q8:256k:
+```yaml
+qwen3.6-35b:256k:
   ttl: 1200
   env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
+    - "LD_LIBRARY_PATH=/path/to/llama.cpp/build-hip/bin:/opt/rocm/lib"
     - "HIP_VISIBLE_DEVICES=0"
     - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=18"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_LAYER_PLAN_FILE=/path/to/hotseat/hot-layer-plan.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/path/to/hotseat/hotexpert-profile.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=1,2,0,3,11,23,10,22,15,12"
+    - "HOTSEAT_FULL_LAYER_COUNT=10"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/path/to/hotseat/arena-text"
+    - "HOTSEAT_RUNTIME_LOG=/path/to/hotseat/swaps.jsonl"
   cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
+    /path/to/llama.cpp/build-hip/bin/llama-server
     --host 127.0.0.1
     --port ${PORT}
     --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
+    -m /path/to/model.gguf
     -c 262144
     -ngl 999
-    -t 4
+    -t 6
+    -tb 16
     -np 1
-    -b 256
-    -ub 64
+    -b 2048
+    -ub 1024
     --cache-ram 0
     --no-mmap
     --mlock
-    --verbose
   checkEndpoint: /health
+```
 
-视觉模型入口：
+### 日志
 
-qwen36-vision:256k:
-  ttl: 1200
-  env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
-    - "HIP_VISIBLE_DEVICES=0"
-    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=16"
-  cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
-    --host 127.0.0.1
-    --port ${PORT}
-    --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
-    --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
-    -c 262144
-    -ngl 999
-    -t 4
-    -np 1
-    -b 256
-    -ub 64
-    --cache-ram 0
-    --no-mmap
-    --mlock
-    --verbose
-  checkEndpoint: /health
-注意事项
+动态专家交换常见事件：
 
-当前建议不要同时启用以下统一内存变量：
+```json
+{"event":"expert_swap", ...}
+```
 
-HSA_XNACK=1
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+完整层交换：
 
-原因是当前 HotSeat v0 的目标是 VRAM-first placement。
-统一内存可能会让 VRAM 与 RAM 的边界变得模糊，导致显存使用不符合预期。
+```json
+{"event":"full_layer_swap", ...}
+```
 
-这不是说统一内存无用，而是它属于另一条路线。
-后续可以考虑做 VRAM-first + UMA fallback，但不建议在 v0 阶段混在一起测试。
+Arena 路径还可能出现：
 
-下一步计划：MoE HotSeat v1
+```text
+arena_expand
+arena_retire
+arena_full_swap
+```
 
-v0 是静态策略：
+### 源码包
 
-前 N 个 block 的 expert tensors 进 VRAM
+当前合体源码包位于：
 
-v1 计划变成真正的动态 HotSeat：
+```text
+source/moe-dynamic-hybrid-arena-source-20260807.tar.gz
+```
 
-统计 router 实际调用了哪些 expert
-记录 layer_id + expert_id 命中次数
-找出真正高频的 hot experts
-让 hot experts 常驻 VRAM
-让 cold experts 留在 RAM / Host
-必要时进行动态迁移和调度
+解压后源码位于 `patch/`，结构包括：
 
-一句话：
+```text
+patch/
+├─ ggml/include/ggml-hotexpert.h
+├─ ggml/src/ggml-hotexpert.cpp
+├─ ggml/src/ggml-cuda/hotexpert-*.cu/.cuh
+├─ ggml/src/ggml-cuda/mmq.cu
+├─ ggml/src/ggml-cuda/mmvq.cu
+├─ ggml/src/ggml-cuda/topk-moe.cu
+├─ src/llama-model-loader.cpp
+├─ src/llama-graph.cpp
+└─ tools/server/server.cpp
+```
 
-v0 是前排先上车；
-v1 要做到谁热谁坐前排。
+这些文件是按 **HotSeat → HotExpert → Dynamic-Hybrid/Arena** 的顺序合并后的最终版本，不需要再手工把三层补丁互相覆盖。
 
-项目状态
+### 状态
 
-当前项目仍处于实验阶段。
-代码和补丁需要根据具体 llama.cpp 版本适配。
-欢迎测试、修改和提交 issue。
+这是实验性 llama.cpp 补丁，不是上游官方功能。不同 llama.cpp 提交之间可能需要手工适配，尤其是 CUDA/HIP kernel、MoE graph、server 和 model-loader 发生变化时。
 
-English
-Overview
+---
 
-MoE HotSeat is an experimental optimization strategy for local MoE model inference.
+## English
 
-The core idea is simple:
+### What is this?
 
-VRAM is not a storage room.
-It is a front-row seat.
-The most important tensors should sit there first.
+This repository upgrades the original static **MoE HotSeat** idea into an integrated runtime for large MoE inference on memory-constrained consumer GPUs:
 
-In MoE models, the largest tensors are often not attention, norm, or router weights, but packed expert tensors, such as:
+- **HotSeat**: VRAM-first placement for packed MoE expert tensors.
+- **HotExpert**: router-hit profiling and per-expert hot cache management.
+- **Dynamic-Hybrid**: runtime management of both Full-Layer banks and Top-64 expert banks, including full-layer promotion/demotion.
+- **Full Shadow Bank**: a dedicated staging bank for safe full-layer swaps.
+- **Arena**: an optional adaptive VRAM cache sized from the observed physical free-memory low-water mark.
 
-ffn_gate_exps
-ffn_up_exps
-ffn_down_exps
+The goal is not to force the entire model into VRAM. The goal is to keep the most valuable MoE weights on the GPU and adapt when the hot set changes.
 
-MoE HotSeat v0 places the expert tensors of the first N transformer blocks into VRAM, while keeping later expert tensors in RAM / Host memory.
+### Runtime layout
 
-This is not yet a fully dynamic hot expert cache.
-It is a static VRAM-first expert tensor placement strategy.
+```text
+Host / RAM
+  └─ complete MoE expert tensor backing store
 
-Why this project?
+GPU / VRAM
+  ├─ Full-Layer banks
+  ├─ Full Shadow bank
+  ├─ Top-64 banks
+  ├─ Dynamic expert pool
+  └─ Optional Arena
+```
 
-When running large MoE models on consumer GPUs, we often face a painful tradeoff:
+### Dynamic-Hybrid mode
 
-The total model size is large;
-24GB VRAM cannot hold everything comfortably;
-CPU / RAM-only inference is too slow;
-Traditional layer-level offload is not fine-grained enough;
-Unified memory may not reliably enforce VRAM-first placement.
+```bash
+HOTSEAT_RUNTIME_MODE=dynamic-hybrid
+```
 
-MoE HotSeat does not try to force the entire model into VRAM.
-Instead, it prioritizes the most valuable expert tensors.
+In this mode, the runtime owns GPU expert banks while host memory remains the stable backing store. Router statistics drive expert replacement, and sufficiently persistent layer-level hotness can trigger `full_layer_swap` events.
 
-Current Strategy: MoE HotSeat v0
+### Full Shadow rotation fix
 
-Example:
+This integrated source includes the shadow rotation fix:
 
-HOTSEAT_TENSOR_LAYERS=18
+```cpp
+s.full_shadow_idx = old_full;
+```
 
-This means:
+After a full-layer swap, the demoted full bank becomes the new idle shadow bank. This prevents the next full-layer swap from overwriting the bank that was just promoted and is already serving traffic.
 
-Expert tensors in blk.0  - blk.17 -> VRAM
-Expert tensors in blk.18 and later -> RAM / Host
+### Arena workflow
 
-Important clarification:
+Arena is intentionally measured before it is applied.
 
-This does not mean “18 experts are placed in VRAM”.
-It also does not mean “the first 18 full transformer layers are placed in VRAM”.
+Measurement phase:
 
-It means:
-the packed MoE expert tensors in the first 18 transformer blocks are placed in VRAM.
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_AUTO_PROFILE_DIR=/path/to/arena-profile-dir
+```
 
-Benchmark Example
+Run representative workloads and collect the generated fingerprint profile.
 
-Test environment:
+Application phase:
 
-CPU: AMD Ryzen 9 9950X
-GPU: AMD Radeon RX 7900 XTX 24GB
-RAM: 192GB
-Backend: llama.cpp HIP / ROCm
-Model: Qwen3.6 35B A3B Q8 GGUF
-Context: 256K
+```bash
+HOTSEAT_AUTO_RESERVE_ARENA=1
+HOTSEAT_ARENA_APPLY_PROFILE=/path/to/<fingerprint>.profile.json
+```
 
-Observed results:
-
-Text model:
-HotSeat layers: 18
-Threads: -t 4
-Generation speed: ~34.7 token/s
-
-Vision model:
-HotSeat layers: 16
-Threads: -t 4
-Generation speed: ~32.9 token/s
-
-VRAM usage:
-~90%+
-
-This shows that a 24GB consumer AMD GPU can run a MoE 35B Q8 model with a 256K context at practical speeds when expert tensor placement is handled carefully.
+Reload the model after applying the profile. Use separate profile directories for text, vision, and different models when their VRAM pressure differs.
 
-Difference from regular -ngl
+### Source bundle
 
-Regular -ngl is mostly layer-level GPU offload.
+The integrated source bundle is stored at:
 
-MoE HotSeat is more fine-grained:
+```text
+source/moe-dynamic-hybrid-arena-source-20260807.tar.gz
+```
 
-Regular -ngl: mainly transformer-layer granularity;
-MoE HotSeat: additional placement control for packed MoE expert tensors.
+After extraction, the final implementation lives under `patch/`. It is already layered in this order:
 
-Current v0 focuses on:
+```text
+HotSeat -> HotExpert -> Dynamic-Hybrid + Arena
+```
 
-ffn_gate_exps
-ffn_up_exps
-ffn_down_exps
-Thread Tuning
+You do not need to manually overlay the three historical patch stages.
 
-More CPU threads are not always better.
+### Status
 
-In this test setup:
+Experimental. This is not an upstream llama.cpp feature. Expect adaptation work when rebasing onto newer llama.cpp revisions, especially around model loading, MoE graph construction, CUDA/HIP kernels, and server integration.
 
--t 32: much slower, heavy CPU contention
--t 16: significantly better
--t 8 : good
--t 4 : best balanced result
--t 2 : lower CPU usage, slightly slower
+## License
 
-Recommended setting:
-
--t 4
-
-Too many CPU threads may increase scheduling overhead, memory bandwidth contention, and Host tensor access overhead.
-
-llama-swap Example
-
-Text model:
-
-qwen36-35b-a3b-v2-q8:256k:
-  ttl: 1200
-  env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
-    - "HIP_VISIBLE_DEVICES=0"
-    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=18"
-  cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
-    --host 127.0.0.1
-    --port ${PORT}
-    --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
-    -c 262144
-    -ngl 999
-    -t 4
-    -np 1
-    -b 256
-    -ub 64
-    --cache-ram 0
-    --no-mmap
-    --mlock
-    --verbose
-  checkEndpoint: /health
-
-Vision model:
-
-qwen36-vision:256k:
-  ttl: 1200
-  env:
-    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp/build-hip/bin:/opt/rocm/lib"
-    - "HIP_VISIBLE_DEVICES=0"
-    - "HSA_OVERRIDE_GFX_VERSION=11.0.0"
-    - "HOTSEAT_TENSOR_LAYERS=16"
-  cmd: >
-    /app/share/llama_box/src/llama.cpp/build-hip/bin/llama-server
-    --host 127.0.0.1
-    --port ${PORT}
-    --jinja
-    -m /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/Qwen3.6-35B-A3B-abliterated-v2.Q8_0.gguf
-    --mmproj /app/share/llm/Qwen3.6-35B-A3B-abliterated-v2-Q8_0/mmproj-BF16.gguf
-    -c 262144
-    -ngl 999
-    -t 4
-    -np 1
-    -b 256
-    -ub 64
-    --cache-ram 0
-    --no-mmap
-    --mlock
-    --verbose
-  checkEndpoint: /health
-Notes
-
-For the current v0 implementation, it is recommended not to enable:
-
-HSA_XNACK=1
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
-
-The reason is that v0 focuses on VRAM-first placement.
-Unified memory may blur the boundary between VRAM and RAM, making placement harder to reason about.
-
-This does not mean unified memory is useless.
-It may be useful in a future VRAM-first + UMA fallback design.
-
-Roadmap: MoE HotSeat v1
-
-v0 is static:
-
-Expert tensors of the first N blocks go into VRAM.
-
-v1 should become a real dynamic HotSeat:
-
-Track router-selected experts
-Record layer_id + expert_id hit counts
-Identify truly hot experts
-Keep hot experts resident in VRAM
-Keep cold experts in RAM / Host
-Support dynamic migration and scheduling
-
-In one sentence:
-
-v0 lets the front rows board first;
-v1 lets the truly hot experts sit in front.
-
-Status
-
-This project is experimental.
-The patch may need adaptation for different llama.cpp versions.
-Issues and experiments are welcome.
-EOF
+MIT. See `LICENSE`.
