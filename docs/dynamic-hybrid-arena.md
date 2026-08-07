@@ -9,3 +9,5 @@ HotSeat -> HotExpert -> Dynamic-Hybrid + Arena -> Full Shadow rotation fix
 ```
 
 For architecture, environment variables, Arena measure/apply workflow, and complete llama-swap model entries, see the bilingual root `README.md` and `examples/llama-swap-dynamic-hybrid-arena.yaml`.
+
+The `patch/` directory is generated from the preserved integrated tar bundle so the browsable source matches the release bundle byte-for-byte.
