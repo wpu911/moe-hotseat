@@ -3,7 +3,7 @@ name: Expand integrated source tree
 on:
   push:
     branches:
-      - dynamic-hybrid-arena
+      - main
 
 permissions:
   contents: write
@@ -13,10 +13,10 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR branch
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: dynamic-hybrid-arena
+          ref: main
           fetch-depth: 0
 
       - name: Expand integrated source bundle
@@ -29,9 +29,7 @@ jobs:
           cp -a "$tmp/patch" ./patch
           rm -rf "$tmp"
 
-          # This workflow is only a one-shot bootstrapper. Remove it from the
-          # resulting source commit so the repository does not carry a deploy
-          # robot forever for a job that has already finished.
+          # One-shot bootstrapper. Remove it in the generated source commit.
           rm -f .github/workflows/unpack-integrated-source.yml
 
       - name: Commit expanded source
@@ -46,4 +44,4 @@ jobs:
             exit 0
           fi
           git commit -m "Expand integrated Dynamic-Hybrid Arena source tree"
-          git push origin HEAD:dynamic-hybrid-arena
+          git push origin HEAD:main
